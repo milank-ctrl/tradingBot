@@ -12,20 +12,25 @@ load_dotenv()
 api_key = os.getenv('API_KEY')
 database_url = os.getenv('DATABASE_URL')
 
-
-class MeanReversionStrategy:
-    def __init__(self, symbol, start_date, end_date, fast_window = 20, slow_window = 50) -> None:
+class fetchData:
+    def __init__(self, symbol, start_date, end_date):
         self.symbol = symbol
         self.start_date = start_date
         self.end_date = end_date
-        self.fast_window = fast_window
-        self.slow_window = slow_window
-        self.data = None
 
     def download_data(self):
         self.data = yf.download(self.symbol, start = self.start_date, end = self.end_date)
         return self.data 
     
+class MeanReversionStrategy:
+    def __init__(self, symbol, start_date, end_date, fast_window = 20, slow_window = 50):
+        self.symbol = symbol
+        self.start_date = start_date
+        self.end_date = end_date
+        self.fast_window = fast_window
+        self.slow_window = slow_window
+        self.data = fetchData(self.symbol, self.start_date, self.end_date).download_data()
+
     def generate_signals(self):
         self.data['Fast_MA'] = self.data['Close'].rolling(window = self.fast_window).mean()
         self.data['Slow_MA'] = self.data['Close'].rolling(window = self.slow_window).mean()
@@ -60,7 +65,6 @@ class MeanReversionStrategy:
         self.data.to_csv(f"MRS_{self.symbol}_{self.start_date}_{self.end_date}.csv")
 
     def run_strategy(self):
-        self.download_data()
         self.generate_signals()
         self.calculate_return()
 

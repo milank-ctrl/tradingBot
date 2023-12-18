@@ -1,11 +1,15 @@
 
 import pandas as pd
-import yfinance as yf 
 import matplotlib.pyplot as plt
+from binance.spot import Spot as Client
+from dotenv import load_dotenv
+from datetime import date
+import os
+from sklearn.model_selection import ParameterGrid
 
-
-def save_to_file(data, symbol, start_date, end_date):
-    data.to_csv(f"MRS_{symbol}_{start_date}_{end_date}.csv")
+def save_to_file(data, symbol):
+    date_ = date.today()
+    data.to_csv(f"MRS_{symbol}_{date_}.csv")
 
 def stop_loss_signal(buy_price, stop_loss_pct):
         stop_loss_price = buy_price * (1 - stop_loss_pct / 100)
@@ -17,25 +21,126 @@ def death_cross_signal(fast_ma, slow_ma):
 def golden_cross_signal(fast_ma, slow_ma):
     return fast_ma > slow_ma 
 
-class DataDownloader:
-    def __init__(self, symbol, start_date, end_date):
+class TradingStrategyOptimizer:
+    def __init__(self, data, symbol, investment, strategy_class):
+        self.data = data
         self.symbol = symbol
-        self.start_date = start_date
-        self.end_date = end_date
+        self.investment = investment
+        self.strategy_class = strategy_class
 
+    def evaluate_strategy(self, fast_window, slow_window, stop_loss_pct):
+        strategy = self.strategy_class(self.symbol, self.data, self.investment, fast_window, slow_window, stop_loss_pct)
+        strategy.run_strategy()
+        return strategy.fetch_performance()
+    
+    def grid_search(self, param_grid):
+        grid = ParameterGrid(param_grid)
+        results_df = pd.DataFrame(columns=['Stop_Loss_PCT', 'Fast_MA', 'Slow_MA', 'Performance_Metric'])
+
+        index = 0
+        for params in grid:
+            index += 1
+            stop_loss_pct = params['Stop_Loss_PCT']
+            fast_ma = params['Fast_MA']
+            slow_ma = params['Slow_MA']
+     
+            performance_metric = self.evaluate_strategy(fast_window = fast_ma, slow_window = slow_ma, stop_loss_pct = stop_loss_pct)
+
+            performance_dict = {
+                'index': index,
+                'Stop_Loss_PCT': stop_loss_pct,
+                'Fast_MA': fast_ma,
+                'Slow_MA': slow_ma,
+                'Performance_Metric': performance_metric
+            }
+            performance_df = pd.DataFrame(performance_dict, index = [0])
+            results_df = pd.concat([results_df, performance_df], ignore_index = True)
+
+        results_df = results_df.drop(['index'], axis = 1)
+        results_df = results_df.sort_values(by = ['Performance_Metric'], ascending = False, ignore_index=True)
+
+        return results_df
+
+class CreateConnection:
+    def __init__(self):
+        self._api_key = None
+        self._api_secret = None
+        
+    def load_env(self):
+        load_dotenv()
+        self._api_key = os.getenv('API_KEY')
+        self._api_secret = os.getenv('API_SECRET')
+
+    def auth(self):
+        try:
+            self.load_env()
+            _client = Client(self._api_key, self._api_secret)
+            return _client
+        except Exception as e:
+            print(f"Authentication failed: {e}")
+            return None
+
+class DataDownloader:
+    def __init__(self, symbol, interval, limit):
+        self.symbol = symbol
+        self.interval = interval
+        self.limit = limit
+        self._client = CreateConnection().auth()
+        
     def download_data(self):
-        data = yf.download(self.symbol, start = self.start_date, end = self.end_date)
-        return data 
+        if self._client is None:
+            return None
+        try:
+            _klines = self._client.klines(self.symbol, self.interval, limit = self.limit)
+            data = pd.DataFrame(_klines)
+            data.columns = ['Open_Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Kline_Close_time', 'Quote_Asset_Volume', 'Nr_Trades', 'Taker_Buy_Asset_Vol', 'Taker_Buy_Q_Vol', 'Flag']
+            data = data.drop(['Kline_Close_time', 'Quote_Asset_Volume', 'Nr_Trades', 'Taker_Buy_Asset_Vol', 'Taker_Buy_Q_Vol', 'Flag'], axis = 1)
+            data['Date'] = pd.to_datetime(data.Open_Time, unit = 'ms')
+            data[[ 'Open', 'High', 'Low', 'Close']] = data[[ 'Open', 'High', 'Low', 'Close']].apply(pd.to_numeric)
+            return data 
+        except Exception as e:
+            print(f"Data download failed: {e}")
+            return None
     
 class ReturnCalculator:
     def __init__(self, data, investment):
         self.data = data
         self.investment = investment
+        self._initial_investment = investment
 
-    def calc_return(self, original_price, current_price):
+    def _calc_return(self, original_price, current_price):
         return_price = (current_price-original_price)/original_price
         return return_price
     
+    def calc_performance(self):
+        performance_dic = {}
+        meta_data_dic = {}
+        meta_data_lst = []
+        
+        # net profit
+        last_profit_index = self.data[self.data['Profit'].notna() & (self.data['Profit'] != 0)].last_valid_index()
+        last_profit = self.data.at[last_profit_index, 'Profit']
+        net_profit = last_profit - self._initial_investment
+
+        # win ratio
+        count_winners_condition = (self.data['Return_PCT'] > 0)
+        count_total_condition = (self.data['Signal'] == 'Sold')
+
+        count_winners_total = count_total_condition.sum()
+        count_winners = count_winners_condition.sum()
+        win_ratio = count_winners / count_winners_total
+        
+        # storing data
+        meta_data_dic['_initial_investment'] = self._initial_investment
+        meta_data_dic['last_profit'] = last_profit
+        meta_data_lst.append(meta_data_dic)
+
+        performance_dic['meta_data'] = meta_data_lst
+        performance_dic['net_profit'] = net_profit
+        performance_dic['win_ratio'] = win_ratio
+
+        return performance_dic
+
     def calculate_return(self):
 
         self.data['Buying_Value'] = 0
@@ -58,7 +163,7 @@ class ReturnCalculator:
                 current_price = row['Close']
                 original_price = self.data.loc[self._return_Index, 'Close']
                 investment_amount = self.investment 
-                return_pct = self.calc_return(original_price, current_price)
+                return_pct = self._calc_return(original_price, current_price)
                 profit = investment_amount * return_pct
                 total_budget = profit + investment_amount
 
@@ -69,10 +174,10 @@ class ReturnCalculator:
                 self.investment = total_budget
         
 class MeanReversionStrategy:
-    def __init__(self, symbol, start_date, end_date, data, investment, stop_loss_pct = 5, fast_window = 20, slow_window = 100):
+   
+    def __init__(self, symbol, data, investment, fast_window, slow_window, stop_loss_pct):
         self.symbol = symbol
-        self.start_date = start_date
-        self.end_date = end_date
+        self.start_date = None
         self.investment = investment
         self.stop_loss_pct = stop_loss_pct
         self.fast_window = fast_window
@@ -124,10 +229,17 @@ class MeanReversionStrategy:
             else:
                 self.data.loc[index, 'Signal'] = 'Waiting to Buy'
 
-        self.data = self.data.drop(columns=['Open', 'High', 'Low', 'Adj Close'])
 
     def calculate_return(self):
-        ReturnCalculator(self.data, self.investment).calculate_return()
+        return_calculater = ReturnCalculator(self.data, self.investment)
+        return_calculater.calculate_return()
+        
+
+    def fetch_performance(self):
+        return_calculater = ReturnCalculator(self.data, self.investment)
+        
+        performance_metric = return_calculater.calc_performance()
+        return performance_metric['net_profit']
 
     def draw_roi_plot(self):
 
@@ -153,25 +265,44 @@ class MeanReversionStrategy:
         plt.legend()
         plt.show()
 
+    def save_data(self):
+        save_to_file(self.data, self.symbol)
+
     def run_strategy(self):
         self.generate_signals()
         self.calculate_return()
-        save_to_file(self.data, self.symbol, self.start_date, self.end_date)
+        
 
 
 def Main():
 
     # Download historical stock price data
-    symbol = "AAPL"
-    start_date = "2022-01-01"
-    end_date = "2023-01-01"
+    symbol = 'BTCUSDT'
+    interval = '1m'
+    limit = 1000
     investment = 100
 
-    data = DataDownloader(symbol, start_date, end_date).download_data()
-    mrs = MeanReversionStrategy(data=data, symbol=symbol, start_date=start_date, end_date=end_date, investment=investment)
-    mrs.run_strategy()
-    mrs.draw_roi_plot()
-    #mrs.draw_plot()
+    #stop_loss_pct = 10
+    #fast_window = 8
+    #slow_window = 30
 
+    downloader = DataDownloader(symbol, interval, limit)
+    data = downloader.download_data()
+    #print(data)
+    param_grid = {
+        'Stop_Loss_PCT': [1, 3, 5, 10],
+        'Fast_MA': [4, 5, 8, 12],
+        'Slow_MA': [18, 21, 30, 35, 40]
+    }
+
+    optimizer = TradingStrategyOptimizer(data=data, symbol=symbol, investment=investment, strategy_class=MeanReversionStrategy)
+    results = optimizer.grid_search(param_grid)
+    print(results)
+    #print(data)
+    #mrs = MeanReversionStrategy(data=data, symbol=symbol, investment=investment, fast_window=fast_window, slow_window=slow_window, stop_loss_pct=10)
+    #mrs.run_strategy()
+    #mrs.draw_roi_plot()
+    #mrs.draw_plot()
+    #mrs.save_data()
 if __name__ == "__main__":
     Main()
